@@ -46,10 +46,12 @@ interface ScrapedPost {
   dbStatus?: "pending" | "processing" | "success" | "error" | "duplicate" | "dropped";
 }
 
-function getProxyImageUrl(url?: string): string {
+function getProxyImageUrl(url?: string, title?: string): string {
   if (!url) return "";
   if (url.startsWith("/api/")) return url;
-  return `/api/proxy-image?url=${encodeURIComponent(url)}`;
+  let res = `/api/proxy-image?url=${encodeURIComponent(url)}`;
+  if (title) res += `&title=${encodeURIComponent(title)}`;
+  return res;
 }
 
 interface ConsoleLog {
@@ -1498,9 +1500,9 @@ async function runSequentialCrawler(startUrl) {
                           {/* Left: Sequence Number block */}
                           <div className="w-full md:w-32 h-24 bg-[#1A1A1A] text-white border-2 border-[#1A1A1A] rounded-none flex-shrink-0 flex flex-col items-center justify-center relative overflow-hidden group shadow-inner">
                             {post.thumbnail ? (
-                              <img src={getProxyImageUrl(post.thumbnail)} referrerPolicy="no-referrer" onError={(e) => { (e.target as HTMLElement).style.display = 'none'; }} className="absolute inset-0 w-full h-full object-cover opacity-60 group-hover:opacity-80 transition-opacity" />
+                              <img src={getProxyImageUrl(post.thumbnail, post.title)} referrerPolicy="no-referrer" onError={(e) => { (e.target as HTMLElement).style.display = 'none'; }} className="absolute inset-0 w-full h-full object-cover opacity-60 group-hover:opacity-80 transition-opacity" />
                             ) : (post.embeds && post.embeds.length > 0) ? (
-                              <img src={`/api/thumbnail?url=${encodeURIComponent(post.embeds[0])}`} referrerPolicy="no-referrer" onError={(e) => { (e.target as HTMLElement).style.display = 'none'; }} className="absolute inset-0 w-full h-full object-cover opacity-60 group-hover:opacity-80 transition-opacity" />
+                              <img src={`/api/thumbnail?url=${encodeURIComponent(post.embeds[0])}&title=${encodeURIComponent(post.title)}`} referrerPolicy="no-referrer" onError={(e) => { (e.target as HTMLElement).style.display = 'none'; }} className="absolute inset-0 w-full h-full object-cover opacity-60 group-hover:opacity-80 transition-opacity" />
                             ) : null}
 
                             
