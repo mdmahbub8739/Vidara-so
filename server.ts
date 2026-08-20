@@ -183,8 +183,12 @@ async function robustUpsertPost(post: UnifiedPost): Promise<void> {
   const now = new Date().toISOString();
   // Fetch existing to preserve created_at
   const existing = await robustGetPostById(post.post_id);
+  const isVidara = isVidaraPost(post.embeds, post.original_url, post.title);
+  const finalCategories = extractCategories((post.categories || []).join(' #') + ' ' + (post.title || ''), isVidara);
+
   const newPost = {
     ...post,
+    categories: finalCategories,
     created_at: existing ? existing.created_at : now,
     updated_at: now
   };
@@ -232,17 +236,21 @@ async function robustBulkCommitPosts(posts: UnifiedPost[]): Promise<{ committedI
   const { data: existingData } = await supabase.from('unified_posts').select('post_id, created_at').in('post_id', postIds);
   const existingMap = new Map((existingData || []).map(r => [r.post_id, r.created_at]));
 
-  const rows = posts.map(p => ({
-    post_id: p.post_id,
-    title: p.title || 'Untitled',
-    categories: Array.isArray(p.categories) ? p.categories : [],
-    actors: Array.isArray(p.actors) ? p.actors : [],
-    original_url: p.original_url || '',
-    embeds: Array.isArray(p.embeds) ? p.embeds : [],
-    thumbnail_url: p.thumbnail_url || null,
-    created_at: existingMap.get(p.post_id) || now,
-    updated_at: now
-  }));
+  const rows = posts.map(p => {
+    const isVidara = isVidaraPost(p.embeds, p.original_url, p.title);
+    const finalCats = extractCategories((p.categories || []).join(' #') + ' ' + (p.title || ''), isVidara);
+    return {
+      post_id: p.post_id,
+      title: p.title || 'Untitled',
+      categories: Array.isArray(finalCats) ? finalCats : [],
+      actors: Array.isArray(p.actors) ? p.actors : [],
+      original_url: p.original_url || '',
+      embeds: Array.isArray(p.embeds) ? p.embeds : [],
+      thumbnail_url: p.thumbnail_url || null,
+      created_at: existingMap.get(p.post_id) || now,
+      updated_at: now
+    };
+  });
 
   const { error } = await supabase.from('unified_posts').upsert(rows, { onConflict: 'post_id' });
   if (error) {
@@ -258,14 +266,43 @@ async function robustBulkCommitPosts(posts: UnifiedPost[]): Promise<{ committedI
 }
 
 // ─── Text helpers ─────────────────────────────────────────────────────────────
-function extractCategories(title: string): string[] {
+function isVidaraPost(embeds?: string[], postUrl?: string, rawTitle?: string, directLink?: string): boolean {
+  const text = [
+    ...(embeds || []),
+    postUrl || '',
+    rawTitle || '',
+    directLink || ''
+  ].join(' ').toLowerCase();
+  return Boolean(text.match(/vidara\.so|vidara|vidaarax|vidavaca|vidaratem|vidaraw|vidarax|vidaraa/i));
+}
+
+function generatePostSlug(title: string, isVidara: boolean = false): string {
+  let slug = title
+    .toLowerCase()
+    .replace(/https?:\/\/[^\s]+/g, '')
+    .replace(/[^a-z0-9\s-]/g, '')
+    .trim()
+    .replace(/\s+/g, '-');
+  if (!slug) slug = 'video';
+  if (isVidara && !slug.includes('pornvoid-premium')) {
+    slug = `${slug}-pornvoid-premium`;
+  }
+  return slug;
+}
+
+function extractCategories(title: string, isVidara: boolean = false): string[] {
   const tags = title.match(/#[\w-]+/g);
-  if (!tags) return [];
   const forbidden = ['#ad','#ads','#sponsor','#sponsors','#promo','#promos','#brazzers','#naughtyamerica','#realitykings','#bangbros','#mofos'];
-  return Array.from(new Set(
-    tags.filter(t => !forbidden.includes(t.toLowerCase()) && !t.toLowerCase().startsWith('#promo') && !t.toLowerCase().startsWith('#sponsor'))
-        .map(t => t.substring(1))
-  ));
+  const clean = tags
+    ? tags.filter(t => !forbidden.includes(t.toLowerCase()) && !t.toLowerCase().startsWith('#promo') && !t.toLowerCase().startsWith('#sponsor')).map(t => t.substring(1))
+    : [];
+  
+  if (isVidara) {
+    if (!clean.some(c => c.toLowerCase() === 'pornvoid premium' || c.toLowerCase() === 'pornvoid-premium')) {
+      clean.unshift('pornvoid premium');
+    }
+  }
+  return Array.from(new Set(clean));
 }
 
 function cleanTitle(title: string): string {
@@ -720,10 +757,13 @@ async function tryCommitBatch(batchId: string) {
           if (up?.cdnUrl) finalThumb = up.cdnUrl;
         } catch {}
       }
+      const isVidara = isVidaraPost(t.final_embeds || t.original_embeds, t.original_url, t.title);
+      const finalCats = extractCategories((t.categories || []).join(' #') + ' ' + (t.title || ''), isVidara);
+
       return {
         post_id: t.post_id,
         title: t.title,
-        categories: t.categories,
+        categories: Array.isArray(finalCats) ? finalCats : [],
         actors: t.actors,
         original_url: t.original_url,
         embeds: t.final_embeds,
@@ -1086,14 +1126,29 @@ async function startServer() {
           return `https://sxyprn.com${src.startsWith('/') ? '' : '/'}${src}`;
         };
 
-        if (embeds.length > 0) {
-          const thumbSrc = $('meta[itemprop="thumbnailUrl"]').attr('content') || $('video#player_el').attr('poster') || $('.post_video img').attr('data-src') || $('.post_video img').attr('src') || "";
-          const thumbnail = resolveThumbnail(thumbSrc);
-          posts.push({ title, categories: extractCategories(rawTitle), post_url: targetUrl, actors, embeds, duration: "N/A", thumbnail, direct_link: directLink });
-        }
+        const isVidara = isVidaraPost(embeds, targetUrl, rawTitle, directLink);
+        const categories = extractCategories(rawTitle, isVidara);
+        const slug = generatePostSlug(title, isVidara);
+
+        const thumbSrc = $('meta[itemprop="thumbnailUrl"]').attr('content') || $('video#player_el').attr('poster') || $('.post_video img').attr('data-src') || $('.post_video img').attr('src') || "";
+        const thumbnail = resolveThumbnail(thumbSrc);
+        const finalEmbeds = embeds.length > 0 ? embeds : (directLink ? [directLink] : [targetUrl]);
+
+        posts.push({
+          title,
+          slug,
+          categories,
+          post_url: targetUrl,
+          actors,
+          embeds: finalEmbeds,
+          duration: "N/A",
+          thumbnail,
+          direct_link: directLink,
+          is_premium: isVidara
+        });
       } else {
         $('div.post_el_small, div.post_el, .post_card, .post_el_small_mob').each((_, el) => {
-          if (posts.length >= 20) return false;
+          if (posts.length >= 25) return false;
           const rawTitle = $(el).find('.post_el_small_mob_title').text().trim() || $(el).find('a.post_time').attr('title') || $(el).find('.post_title').text().trim() || "";
           const title = cleanTitle(rawTitle);
           const titleEmbeds = extractUrlsFromTitle(rawTitle);
@@ -1130,9 +1185,23 @@ async function startServer() {
           const thumbSrc = $(el).find('img').attr('data-src') || $(el).find('img').attr('src') || "";
           const thumbnail = resolveThumbnail(thumbSrc);
           
-          if (embeds.length > 0) {
-              posts.push({ title, categories: extractCategories(rawTitle), post_url: postUrl, actors, embeds, duration, thumbnail, direct_link: directLink });
-          }
+          const isVidara = isVidaraPost(embeds, postUrl, rawTitle, directLink);
+          const categories = extractCategories(rawTitle, isVidara);
+          const slug = generatePostSlug(title, isVidara);
+          const finalEmbeds = embeds.length > 0 ? embeds : (directLink ? [directLink] : (postUrl ? [postUrl] : []));
+          
+          posts.push({
+            title,
+            slug,
+            categories,
+            post_url: postUrl || targetUrl,
+            actors,
+            embeds: finalEmbeds,
+            duration,
+            thumbnail,
+            direct_link: directLink,
+            is_premium: isVidara
+          });
         });
       }
 

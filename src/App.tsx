@@ -59,6 +59,11 @@ function resolveMasterImageUrl(thumbOrId?: string, masterDomain?: string): strin
   return `${base}/img/${trimmed}`;
 }
 
+function isVidaraEmbed(embeds?: string[], directLink?: string, postUrl?: string, categories?: string[]): boolean {
+  const text = [...(embeds || []), directLink || '', postUrl || '', ...(categories || [])].join(' ').toLowerCase();
+  return Boolean(text.match(/vidara\.so|vidara|vidaarax|vidavaca|vidaratem|vidaraw|vidarax|vidaraa|pornvoid/i));
+}
+
 function getProxyImageUrl(url?: string, title?: string, postId?: string, masterDomain?: string): string {
   if (!url) return "";
   const resolved = resolveMasterImageUrl(url, masterDomain);
@@ -1742,6 +1747,11 @@ async function runSequentialCrawler(startUrl) {
                                                             <h3 className="text-sm md:text-base font-bold text-[#1A1A1A] leading-tight font-serif flex items-center gap-2 flex-wrap">
                                 <span className="font-mono text-xs bg-zinc-100 text-zinc-500 px-1.5 py-0.5 border border-zinc-200 uppercase">ID: {calculatePostId(post.post_url)}</span>
                                 <span className="italic">{post.title}</span>
+                                {isVidaraEmbed(post.embeds, post.direct_link, post.post_url, post.categories) && (
+                                  <span className="text-[10px] font-mono font-bold bg-amber-400 text-black border border-[#1A1A1A] px-1.5 py-0.5 whitespace-nowrap uppercase shadow-[1px_1px_0px_#1A1A1A] flex items-center gap-1">
+                                    💎 PORNVOID PREMIUM
+                                  </span>
+                                )}
                                 {post.dbStatus === 'success' && <span className="text-[10px] font-mono font-bold bg-emerald-100 text-emerald-800 border border-emerald-200 px-1.5 py-0.5 whitespace-nowrap uppercase">DB Added</span>}
                                 {post.dbStatus === 'processing' && <span className="text-[10px] font-mono font-bold bg-blue-100 text-blue-800 border border-blue-200 px-1.5 py-0.5 whitespace-nowrap uppercase">Cloning...</span>}
                                 {post.dbStatus === 'error' && <span className="text-[10px] font-mono font-bold bg-red-100 text-red-800 border border-red-200 px-1.5 py-0.5 whitespace-nowrap uppercase">DB Error</span>}
@@ -1749,6 +1759,11 @@ async function runSequentialCrawler(startUrl) {
                                 {post.dbStatus === 'pending' && <span className="text-[10px] font-mono font-bold bg-yellow-100 text-yellow-800 border border-yellow-200 px-1.5 py-0.5 whitespace-nowrap uppercase">DB Pending</span>}
                                 {post.dbStatus === 'dropped' && <span className="text-[10px] font-mono font-bold bg-zinc-200 text-zinc-600 border border-zinc-300 px-1.5 py-0.5 whitespace-nowrap uppercase">Not Queued</span>}
                               </h3>
+                              {isVidaraEmbed(post.embeds, post.direct_link, post.post_url, post.categories) && (
+                                <div className="mt-1 text-[10px] font-mono text-amber-900 bg-amber-50 border border-amber-300 px-2 py-0.5 inline-block">
+                                  <span className="font-bold">slug:</span> {post.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'video'}-pornvoid-premium
+                                </div>
+                              )}
                               
                               {post.categories && post.categories.length > 0 && (
                                 <div className="mt-1.5 flex flex-wrap gap-1">
@@ -2169,6 +2184,7 @@ async function runSequentialCrawler(startUrl) {
                         className="bg-white border border-[#1A1A1A] text-[#1A1A1A] text-xs px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-[#1A1A1A]"
                       >
                         <option value="All">All Categories</option>
+                        <option value="pornvoid premium">💎 Pornvoid Premium (VIP)</option>
                         <option value="onlyfans">onlyfans</option>
                         <option value="fansly">fansly</option>
                         <option value="general">general</option>
@@ -2325,9 +2341,21 @@ async function runSequentialCrawler(startUrl) {
                              </div>
                            )}
                            <div className="flex-1 min-w-0">
-                              <h4 className="text-xs font-bold text-[#1A1A1A] truncate">{post.title}</h4>
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <h4 className="text-xs font-bold text-[#1A1A1A] truncate">{post.title}</h4>
+                                {isVidaraEmbed(post.embeds, '', post.original_url, post.categories) && (
+                                  <span className="text-[9px] font-mono font-bold bg-amber-400 text-black border border-[#1A1A1A] px-1.5 py-0.2 uppercase shadow-[1px_1px_0px_#1A1A1A] flex items-center gap-1">
+                                    💎 PORNVOID PREMIUM
+                                  </span>
+                                )}
+                              </div>
                               <div className="flex flex-wrap items-center gap-2 mt-1">
                                 <span className="text-[10px] font-mono text-zinc-500">ID: {post.post_id}</span>
+                                {isVidaraEmbed(post.embeds, '', post.original_url, post.categories) && (
+                                  <span className="text-[9px] font-mono text-amber-900 bg-amber-50 border border-amber-300 px-1.5 py-0.5 rounded-sm">
+                                    slug: {post.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'video'}-pornvoid-premium
+                                  </span>
+                                )}
                                 {post.thumbnail_url && !(post.thumbnail_url.includes('.workers.dev/') || post.thumbnail_url.startsWith('https://goonimage')) && (
                                   <button
                                     onClick={() => handleSinglePostCdnUpload(post.post_id, post.thumbnail_url)}
@@ -2338,7 +2366,7 @@ async function runSequentialCrawler(startUrl) {
                                   </button>
                                 )}
                                 {post.categories && post.categories.length > 0 && post.categories.map((cat: string, idx: number) => (
-                                  <span key={idx} className="text-[10px] font-mono font-bold bg-[#1A1A1A] text-white px-1 py-0.5 rounded-sm">
+                                  <span key={idx} className={`text-[10px] font-mono font-bold px-1 py-0.5 rounded-sm ${cat.toLowerCase().includes('pornvoid') ? 'bg-amber-400 text-black border border-black' : 'bg-[#1A1A1A] text-white'}`}>
                                     {cat}
                                   </span>
                                 ))}
