@@ -46,11 +46,13 @@ interface ScrapedPost {
   dbStatus?: "pending" | "processing" | "success" | "error" | "duplicate" | "dropped";
 }
 
-function getProxyImageUrl(url?: string, title?: string): string {
+function getProxyImageUrl(url?: string, title?: string, postId?: string): string {
   if (!url) return "";
   if (url.startsWith("/api/")) return url;
+  if (url.includes(".workers.dev/img/")) return url;
   let res = `/api/proxy-image?url=${encodeURIComponent(url)}`;
   if (title) res += `&title=${encodeURIComponent(title)}`;
+  if (postId) res += `&id=${encodeURIComponent(postId)}`;
   return res;
 }
 
@@ -105,13 +107,26 @@ export default function App() {
   const [isCrawling, setIsCrawling] = useState(false);
   const [scrapedData, setScrapedData] = useState<ScrapedPost[]>([]);
   const [logs, setLogs] = useState<ConsoleLog[]>([]);
-  const [activeTab, setActiveTab] = useState<"posts" | "json" | "uploads" | "database" | "remotefiles" | "queue" | "links">("posts");
+  const [activeTab, setActiveTab] = useState<"posts" | "json" | "uploads" | "database" | "remotefiles" | "queue" | "links" | "images">("posts");
   const [isLoading, setIsLoading] = useState(false);
   const [copiedText, setCopiedText] = useState<string | null>(null);
   const [cfDomain, setCfDomain] = useState("https://apiv2.pasamaraooo49.workers.dev/embed");
   const [actorFilter, setActorFilter] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [autoQueueToDb, setAutoQueueToDb] = useState(true); // Always on by default
+
+  // ── Cloudflare Image Worker & R2 Engine States ──────────────────────────────
+  const [imageWorkerUrl, setImageWorkerUrl] = useState("https://goonimage.pasamaraooo49.workers.dev");
+  const [imageWorkerStatus, setImageWorkerStatus] = useState<any>(null);
+  const [imageStats, setImageStats] = useState<{ total: number; with_thumbnail: number; on_cloudflare_cdn: number; external_source: number; missing_thumbnail: number; worker_url?: string } | null>(null);
+  const [isImageSyncing, setIsImageSyncing] = useState(false);
+  const [imageSyncLimit, setImageSyncLimit] = useState(50);
+  const [imageSyncForceAll, setImageSyncForceAll] = useState(false);
+  const [imageSyncLog, setImageSyncLog] = useState<string | null>(null);
+  const [testImageUrl, setTestImageUrl] = useState("");
+  const [testImageResult, setTestImageResult] = useState<any>(null);
+  const [isTestingImage, setIsTestingImage] = useState(false);
+  const [autoSyncImagesToR2, setAutoSyncImagesToR2] = useState(true);
 
   // ── Server-side crawler state (survives browser close) ─────────────────────
   const [serverCrawlerState, setServerCrawlerState] = useState<any>(null);
@@ -203,6 +218,138 @@ export default function App() {
   const [remoteFilesTotalPages, setRemoteFilesTotalPages] = useState<{byse: number, dood: number}>({byse: 1, dood: 1});
   const [isRemoteFilesLoading, setIsRemoteFilesLoading] = useState(false);
   const [remoteFilesError, setRemoteFilesError] = useState("");
+
+  // ── Cloudflare Image Worker & R2 Handlers ─────────────────────────────────
+  const fetchImageWorkerStatus = async (urlToTest?: string) => {
+    try {
+      const target = urlToTest || imageWorkerUrl;
+      const res = await fetch(`/api/image-worker/status?worker_url=${encodeURIComponent(target)}`);
+      if (res.ok) {
+        const data = await res.json();
+        setImageWorkerStatus(data);
+        return data;
+      }
+    } catch (e: any) {
+      setImageWorkerStatus({ connected: false, error: e.message });
+    }
+  };
+
+  const fetchImageStats = async () => {
+    try {
+      const res = await fetch("/api/image-worker/stats");
+      if (res.ok) {
+        const data = await res.json();
+        setImageStats(data);
+        return data;
+      }
+    } catch {}
+  };
+
+  useEffect(() => {
+    fetchImageWorkerStatus();
+    fetchImageStats();
+  }, []);
+
+  const handleSaveImageWorkerUrl = async (newUrl: string) => {
+    const trimmed = newUrl.trim();
+    setImageWorkerUrl(trimmed);
+    try {
+      await fetch("/api/image-worker/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ worker_url: trimmed })
+      });
+      await fetchImageWorkerStatus(trimmed);
+      addLog("success", `Cloudflare Image Worker URL updated: ${trimmed}`);
+    } catch (e: any) {
+      addLog("error", `Failed to save Worker URL: ${e.message}`);
+    }
+  };
+
+  const handleSyncDbImagesToCdn = async (limit: number = imageSyncLimit, forceAll: boolean = imageSyncForceAll) => {
+    setIsImageSyncing(true);
+    setImageSyncLog("Starting Cloudflare R2 / Edge CDN thumbnail sync...");
+    addLog("info", `Initiating Cloudflare R2 Sync (Limit: ${limit}, Force All: ${forceAll})...`);
+
+    try {
+      const res = await fetch("/api/image-worker/sync-db", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          limit,
+          force_all: forceAll,
+          worker_url: imageWorkerUrl
+        })
+      });
+
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Sync failed");
+
+      setImageSyncLog(data.message || `Successfully synced ${data.updated || 0} images!`);
+      addLog("success", data.message || `Image sync completed: ${data.updated} updated.`);
+      
+      // Refresh DB posts and Image stats
+      await fetchImageStats();
+      fetchDbPosts();
+    } catch (e: any) {
+      setImageSyncLog(`Error: ${e.message}`);
+      addLog("error", `Image Worker Sync error: ${e.message}`);
+    } finally {
+      setIsImageSyncing(false);
+    }
+  };
+
+  const handleTestUploadImage = async () => {
+    if (!testImageUrl) return;
+    setIsTestingImage(true);
+    setTestImageResult(null);
+    try {
+      const res = await fetch("/api/image-worker/upload", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          url: testImageUrl,
+          worker_url: imageWorkerUrl
+        })
+      });
+      const data = await res.json();
+      setTestImageResult(data);
+      if (data.success) {
+        addLog("success", `Test image uploaded/proxied: ${data.cdnUrl}`);
+      } else {
+        addLog("warn", `Test image warning: ${data.error || "Fallback to proxy"}`);
+      }
+    } catch (e: any) {
+      setTestImageResult({ success: false, error: e.message });
+      addLog("error", `Test image upload error: ${e.message}`);
+    } finally {
+      setIsTestingImage(false);
+    }
+  };
+
+  const handleSinglePostCdnUpload = async (postId: string, currentThumb: string) => {
+    if (!currentThumb) return;
+    try {
+      addLog("info", `Uploading thumbnail for post ${postId} to Cloudflare R2...`);
+      const res = await fetch("/api/image-worker/upload", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          url: currentThumb,
+          post_id: postId,
+          worker_url: imageWorkerUrl
+        })
+      });
+      const data = await res.json();
+      if (data.success && data.cdnUrl) {
+        setDbPosts((prev: any[]) => prev.map((p: any) => p.post_id === postId ? { ...p, thumbnail_url: data.cdnUrl } : p));
+        addLog("success", `Thumbnail synced to CDN for post ${postId}`);
+        fetchImageStats();
+      }
+    } catch (e: any) {
+      addLog("error", `Failed to upload thumbnail for post ${postId}: ${e.message}`);
+    }
+  };
 
   const fetchRemoteFiles = async (provider?: 'byse' | 'dood', targetPage?: number) => {
     setIsRemoteFilesLoading(true);
@@ -511,7 +658,8 @@ export default function App() {
             let finalEmbeds = [...(post.embeds || []), ...(post.direct_link ? [post.direct_link] : [])];
             return {
               post_id: postId, title: post.title, categories: post.categories,
-              actors: post.actors, original_url: post.post_url, embeds: finalEmbeds
+              actors: post.actors, original_url: post.post_url, embeds: finalEmbeds,
+              thumbnail: post.thumbnail
             };
           });
 
@@ -1400,6 +1548,23 @@ async function runSequentialCrawler(startUrl) {
                 Supabase DB
               </button>
               <button
+                id="tab_images"
+                onClick={() => setActiveTab("images")}
+                className={`flex items-center gap-2 px-4 py-2.5 transition-all uppercase tracking-wider text-[11px] font-sans ${
+                  activeTab === "images" 
+                    ? "border-t-2 border-x-2 border-[#1A1A1A] bg-white font-bold text-[#1A1A1A]" 
+                    : "border-transparent text-zinc-500 hover:text-[#1A1A1A]"
+                }`}
+              >
+                <UploadCloud className="w-3.5 h-3.5 text-amber-600" />
+                Edge Image CDN
+                {imageStats && (
+                  <span className="text-[9px] bg-amber-100 text-amber-900 border border-amber-300 px-1 py-0.2 rounded font-mono font-bold">
+                    {imageStats.on_cloudflare_cdn}/{imageStats.total}
+                  </span>
+                )}
+              </button>
+              <button
                 id="tab_links"
                 onClick={() => setActiveTab("links")}
                 className={`flex items-center gap-2 px-4 py-2.5 transition-all uppercase tracking-wider text-[11px] font-sans ${
@@ -1970,6 +2135,15 @@ async function runSequentialCrawler(startUrl) {
                         Reconcile Links
                       </button>
                       <button
+                        onClick={() => handleSyncDbImagesToCdn(50, false)}
+                        className="bg-amber-600 hover:bg-amber-700 text-white border-2 border-[#1A1A1A] px-3 py-1.5 text-xs font-sans font-bold uppercase tracking-wider shadow-[2px_2px_0px_#1A1A1A] flex items-center gap-1.5"
+                        disabled={isDbLoading || isImageSyncing}
+                        title="Sync thumbnails to Cloudflare R2 / CDN"
+                      >
+                        <UploadCloud className={`w-3.5 h-3.5 ${isImageSyncing ? 'animate-spin' : ''}`} />
+                        {isImageSyncing ? 'Syncing R2...' : 'Sync R2 CDN'}
+                      </button>
+                      <button
                         onClick={clearDb}
                         className="bg-red-500 hover:bg-red-600 text-white border-2 border-[#1A1A1A] px-3 py-1.5 text-xs font-sans font-bold uppercase tracking-wider shadow-[2px_2px_0px_#1A1A1A] flex items-center gap-1.5 ml-auto sm:ml-0"
                         title="Delete all database records"
@@ -2067,15 +2241,31 @@ async function runSequentialCrawler(startUrl) {
                       filteredDbPosts.map((post: any, idx: number) => (
                         <div key={`${post.post_id}-${idx}`} className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 bg-[#FAF8F5] border border-zinc-200 p-3 hover:border-[#1A1A1A] transition-colors group">
                            {post.thumbnail_url && (
-                             <div className="w-20 h-14 bg-zinc-200 shrink-0 border border-zinc-300 relative overflow-hidden">
-                               <img src={getProxyImageUrl(post.thumbnail_url)} referrerPolicy="no-referrer" onError={(e) => { (e.target as HTMLElement).style.display = 'none'; }} className="absolute inset-0 w-full h-full object-cover" />
+                             <div className="w-20 h-14 bg-zinc-200 shrink-0 border border-zinc-300 relative overflow-hidden group/thumb">
+                               <img src={getProxyImageUrl(post.thumbnail_url, post.title, post.post_id)} referrerPolicy="no-referrer" onError={(e) => { (e.target as HTMLElement).style.display = 'none'; }} className="absolute inset-0 w-full h-full object-cover" />
+                               <span className={`absolute bottom-0 inset-x-0 text-[8px] font-mono font-bold text-center py-0.5 uppercase ${
+                                 post.thumbnail_url.includes('.workers.dev/') || post.thumbnail_url.startsWith('https://goonimage')
+                                   ? 'bg-emerald-900/90 text-emerald-200' 
+                                   : 'bg-amber-900/90 text-amber-200'
+                               }`}>
+                                 {post.thumbnail_url.includes('.workers.dev/') || post.thumbnail_url.startsWith('https://goonimage') ? 'CF R2 CDN' : 'EXTERNAL'}
+                               </span>
                              </div>
                            )}
                            <div className="flex-1 min-w-0">
                               <h4 className="text-xs font-bold text-[#1A1A1A] truncate">{post.title}</h4>
                               <div className="flex items-center gap-2 mt-1">
                                 <span className="text-[10px] font-mono text-zinc-500">ID: {post.post_id}</span>
-                                {post.categories && post.categories.length > 0 && post.categories.map((cat, idx) => (
+                                {post.thumbnail_url && !(post.thumbnail_url.includes('.workers.dev/') || post.thumbnail_url.startsWith('https://goonimage')) && (
+                                  <button
+                                    onClick={() => handleSinglePostCdnUpload(post.post_id, post.thumbnail_url)}
+                                    className="text-[9px] font-mono font-bold text-amber-800 bg-amber-100 hover:bg-amber-200 border border-amber-300 px-1.5 py-0.5 rounded-sm flex items-center gap-1 transition-colors"
+                                    title="Upload this thumbnail to Cloudflare R2"
+                                  >
+                                    <UploadCloud className="w-2.5 h-2.5" /> Sync R2
+                                  </button>
+                                )}
+                                {post.categories && post.categories.length > 0 && post.categories.map((cat: string, idx: number) => (
                                   <span key={idx} className="text-[10px] font-mono font-bold bg-[#1A1A1A] text-white px-1 py-0.5 rounded-sm">
                                     {cat}
                                   </span>
@@ -2161,6 +2351,267 @@ async function runSequentialCrawler(startUrl) {
                     </div>
                   )}
                 </div>
+              </div>
+            )}
+
+            {/* TAB: Cloudflare R2 Image CDN */}
+            {activeTab === "images" && (
+              <div className="flex flex-col gap-6">
+                
+                {/* Engine Status & Overview Card */}
+                <div className="bg-white border-2 border-[#1A1A1A] p-6 shadow-[4px_4px_0px_#1A1A1A]">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-[#1A1A1A] pb-4">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-xl">⚡</span>
+                        <h3 className="text-base font-bold font-serif italic text-[#1A1A1A]">
+                          Telegram Storage & Cloudflare Edge CDN Engine
+                        </h3>
+                        <span className={`text-[10px] font-mono font-bold px-2 py-0.5 border ${
+                          imageWorkerStatus?.connected 
+                            ? 'bg-emerald-100 text-emerald-900 border-emerald-500' 
+                            : 'bg-amber-100 text-amber-900 border-amber-500'
+                        }`}>
+                          {imageWorkerStatus?.connected ? `ONLINE (v4.0.2 - Telegram CDN)` : 'CHECKING STATUS...'}
+                        </span>
+                      </div>
+                      <p className="text-xs text-zinc-600 mt-1">
+                        Ultra-fast Telegram Storage Archival with Cloudflare Edge Caching (GET /img/:fileId) and SSRF-hardened zero-copy proxy.
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => { fetchImageWorkerStatus(); fetchImageStats(); }}
+                        className="bg-white hover:bg-zinc-50 text-[#1A1A1A] border-2 border-[#1A1A1A] px-3 py-1.5 text-xs font-mono font-bold uppercase tracking-wider shadow-[2px_2px_0px_#1A1A1A] flex items-center gap-1.5 transition-colors"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5" />
+                        Ping Engine
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Engine Details Bar */}
+                  {imageWorkerStatus && (
+                    <div className="mt-4 bg-[#FAF8F5] border border-zinc-200 p-3 text-xs font-mono grid grid-cols-2 sm:grid-cols-4 gap-3">
+                      <div>
+                        <span className="text-[10px] text-zinc-400 block uppercase">Edge Colo:</span>
+                        <span className="font-bold text-[#1A1A1A]">{imageWorkerStatus.edge_colo || 'SIN (Singapore)'}</span>
+                      </div>
+                      <div>
+                        <span className="text-[10px] text-zinc-400 block uppercase">RAM Cache Entries:</span>
+                        <span className="font-bold text-emerald-700">{imageWorkerStatus.memory_cache_entries ?? 0} active</span>
+                      </div>
+                      <div>
+                        <span className="text-[10px] text-zinc-400 block uppercase">Single Upload Mode:</span>
+                        <span className="font-bold text-blue-700">&lt;20ms instant edge</span>
+                      </div>
+                      <div>
+                        <span className="text-[10px] text-zinc-400 block uppercase">Batch Concurrency:</span>
+                        <span className="font-bold text-purple-700">2x parallel queue</span>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Speed Optimizations Chips */}
+                  {imageWorkerStatus?.speed_optimizations && (
+                    <div className="mt-3 flex flex-wrap gap-1.5">
+                      {imageWorkerStatus.speed_optimizations.map((opt: string, idx: number) => (
+                        <span key={idx} className="text-[9px] font-mono bg-zinc-100 text-zinc-700 border border-zinc-300 px-2 py-0.5">
+                          ✓ {opt}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Metrics Stats Grid */}
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                  <div className="bg-white border-2 border-[#1A1A1A] p-4 text-center shadow-[3px_3px_0px_#1A1A1A]">
+                    <div className="text-2xl font-bold font-serif text-[#1A1A1A]">{imageStats?.total ?? 0}</div>
+                    <div className="text-[10px] uppercase font-bold text-zinc-500 mt-1">Total DB Posts</div>
+                  </div>
+                  <div className="bg-emerald-50 border-2 border-emerald-800 p-4 text-center shadow-[3px_3px_0px_#065F46]">
+                    <div className="text-2xl font-bold font-serif text-emerald-800">{imageStats?.on_cloudflare_cdn ?? 0}</div>
+                    <div className="text-[10px] uppercase font-bold text-emerald-700 mt-1">On Cloudflare CDN / R2</div>
+                  </div>
+                  <div className="bg-amber-50 border-2 border-amber-800 p-4 text-center shadow-[3px_3px_0px_#92400E]">
+                    <div className="text-2xl font-bold font-serif text-amber-800">{imageStats?.external_source ?? 0}</div>
+                    <div className="text-[10px] uppercase font-bold text-amber-700 mt-1">External / Unsynced</div>
+                  </div>
+                  <div className="bg-zinc-50 border-2 border-zinc-400 p-4 text-center shadow-[3px_3px_0px_#71717A]">
+                    <div className="text-2xl font-bold font-serif text-zinc-600">{imageStats?.missing_thumbnail ?? 0}</div>
+                    <div className="text-[10px] uppercase font-bold text-zinc-500 mt-1">No Thumbnail URL</div>
+                  </div>
+                </div>
+
+                {/* Bulk Database Sync Tool */}
+                <div className="bg-white border-2 border-[#1A1A1A] p-6 shadow-[4px_4px_0px_#1A1A1A] flex flex-col gap-4">
+                  <div className="border-b border-[#1A1A1A] pb-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div>
+                      <h4 className="text-sm font-bold font-serif italic text-[#1A1A1A]">
+                        🚀 Bulk Sync Supabase Thumbnails to Cloudflare R2
+                      </h4>
+                      <p className="text-xs text-zinc-600 mt-0.5">
+                        Scrapes and uploads image bytes directly to Cloudflare R2 / Telegram Async CDN and updates the unified_posts database.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 items-end">
+                    <div>
+                      <label className="text-[10px] font-bold uppercase tracking-wider text-zinc-700 block mb-1">
+                        Batch Size Limit:
+                      </label>
+                      <select
+                        value={imageSyncLimit}
+                        onChange={(e) => setImageSyncLimit(Number(e.target.value))}
+                        disabled={isImageSyncing}
+                        className="w-full bg-white border-2 border-[#1A1A1A] px-3 py-2 text-xs font-mono shadow-[2px_2px_0px_#1A1A1A] focus:outline-none"
+                      >
+                        <option value={10}>10 images (Quick test)</option>
+                        <option value={25}>25 images</option>
+                        <option value={50}>50 images (Recommended)</option>
+                        <option value={100}>100 images</option>
+                        <option value={250}>250 images</option>
+                        <option value={500}>500 images</option>
+                      </select>
+                    </div>
+
+                    <div className="flex items-center gap-2 pb-2">
+                      <input
+                        type="checkbox"
+                        id="chk_force_all_images"
+                        checked={imageSyncForceAll}
+                        onChange={(e) => setImageSyncForceAll(e.target.checked)}
+                        disabled={isImageSyncing}
+                        className="w-4 h-4 accent-[#1A1A1A]"
+                      />
+                      <label htmlFor="chk_force_all_images" className="text-xs font-sans text-zinc-700 cursor-pointer">
+                        Force re-upload all (even if already on CDN)
+                      </label>
+                    </div>
+
+                    <button
+                      id="btn_start_r2_sync"
+                      onClick={() => handleSyncDbImagesToCdn()}
+                      disabled={isImageSyncing}
+                      className="w-full bg-[#1A1A1A] hover:bg-zinc-800 text-white font-bold py-2.5 px-4 rounded-none flex items-center justify-center gap-2 transition-all text-xs uppercase tracking-wider border-2 border-[#1A1A1A] shadow-[3px_3px_0px_#FDE68A] disabled:opacity-50"
+                    >
+                      <UploadCloud className={`w-4 h-4 ${isImageSyncing ? 'animate-spin' : ''}`} />
+                      {isImageSyncing ? 'Syncing to Cloudflare...' : 'Start R2 Sync'}
+                    </button>
+                  </div>
+
+                  {/* Sync Status Banner */}
+                  {imageSyncLog && (
+                    <div className={`p-3 border-2 border-[#1A1A1A] text-xs font-mono ${
+                      imageSyncLog.startsWith('Error') 
+                        ? 'bg-red-50 text-red-800' 
+                        : 'bg-emerald-50 text-emerald-900'
+                    }`}>
+                      {imageSyncLog}
+                    </div>
+                  )}
+                </div>
+
+                {/* Worker URL Configuration */}
+                <div className="bg-white border-2 border-[#1A1A1A] p-6 shadow-[4px_4px_0px_#1A1A1A] flex flex-col gap-4">
+                  <h4 className="text-sm font-bold font-serif italic text-[#1A1A1A]">
+                    ⚙️ Cloudflare Image Worker Configuration
+                  </h4>
+                  <div className="flex flex-col sm:flex-row gap-3 items-stretch">
+                    <input
+                      type="text"
+                      value={imageWorkerUrl}
+                      onChange={(e) => setImageWorkerUrl(e.target.value)}
+                      placeholder="https://goonimage.pasamaraooo49.workers.dev"
+                      className="flex-1 bg-white border-2 border-[#1A1A1A] px-3 py-2 text-xs font-mono shadow-[2px_2px_0px_#1A1A1A] focus:outline-none"
+                    />
+                    <button
+                      onClick={() => handleSaveImageWorkerUrl(imageWorkerUrl)}
+                      className="bg-[#1A1A1A] hover:bg-zinc-800 text-white border-2 border-[#1A1A1A] px-4 py-2 text-xs font-mono font-bold uppercase tracking-wider shadow-[2px_2px_0px_#FAF8F5] shrink-0"
+                    >
+                      Save & Test Endpoint
+                    </button>
+                  </div>
+                </div>
+
+                {/* Instant Single Image Tester */}
+                <div className="bg-white border-2 border-[#1A1A1A] p-6 shadow-[4px_4px_0px_#1A1A1A] flex flex-col gap-4">
+                  <h4 className="text-sm font-bold font-serif italic text-[#1A1A1A]">
+                    🧪 Instant Image URL Upload & Latency Test
+                  </h4>
+                  <div className="flex flex-col sm:flex-row gap-3">
+                    <input
+                      type="text"
+                      value={testImageUrl}
+                      onChange={(e) => setTestImageUrl(e.target.value)}
+                      placeholder="Paste image URL (e.g. https://img.sxyprn.com/...)"
+                      className="flex-1 bg-white border-2 border-[#1A1A1A] px-3 py-2 text-xs font-mono shadow-[2px_2px_0px_#1A1A1A] focus:outline-none"
+                    />
+                    <button
+                      onClick={handleTestUploadImage}
+                      disabled={isTestingImage || !testImageUrl}
+                      className="bg-amber-600 hover:bg-amber-700 text-white border-2 border-[#1A1A1A] px-4 py-2 text-xs font-sans font-bold uppercase tracking-wider shadow-[2px_2px_0px_#1A1A1A] shrink-0 disabled:opacity-40"
+                    >
+                      {isTestingImage ? 'Uploading...' : 'Test Upload'}
+                    </button>
+                  </div>
+
+                  {testImageResult && (
+                    <div className="bg-[#FAF8F5] border border-zinc-300 p-4 flex flex-col sm:flex-row gap-4 items-start">
+                      {testImageResult.cdnUrl && (
+                        <div className="w-32 h-24 bg-zinc-200 border border-zinc-400 shrink-0 relative overflow-hidden">
+                          <img 
+                            src={testImageResult.cdnUrl} 
+                            alt="Test Result" 
+                            referrerPolicy="no-referrer"
+                            className="w-full h-full object-cover" 
+                          />
+                        </div>
+                      )}
+                      <div className="flex-1 overflow-x-auto text-xs font-mono space-y-1">
+                        <div><span className="font-bold">CDN URL:</span> <a href={testImageResult.cdnUrl} target="_blank" rel="noreferrer" className="text-blue-600 underline break-all">{testImageResult.cdnUrl}</a></div>
+                        {testImageResult.proxyUrl && (
+                          <div><span className="font-bold">Proxy URL:</span> <a href={testImageResult.proxyUrl} target="_blank" rel="noreferrer" className="text-emerald-700 underline break-all">{testImageResult.proxyUrl}</a></div>
+                        )}
+                        <pre className="text-[10px] bg-zinc-900 text-emerald-400 p-2 rounded mt-2 overflow-x-auto">
+                          {JSON.stringify(testImageResult, null, 2)}
+                        </pre>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Worker Endpoints Documentation Card */}
+                <div className="bg-white border-2 border-[#1A1A1A] p-6 shadow-[4px_4px_0px_#1A1A1A] flex flex-col gap-3">
+                  <h4 className="text-sm font-bold font-serif italic text-[#1A1A1A]">
+                    📡 Worker API Endpoints Specifications
+                  </h4>
+                  <div className="text-xs font-mono divide-y divide-zinc-200">
+                    <div className="py-2 flex flex-col sm:flex-row sm:justify-between gap-1">
+                      <span className="font-bold text-blue-700">POST /upload</span>
+                      <span className="text-zinc-600">Single image upload, returns instant edge CDN URL in &lt;20ms</span>
+                    </div>
+                    <div className="py-2 flex flex-col sm:flex-row sm:justify-between gap-1">
+                      <span className="font-bold text-purple-700">POST /batch-upload-urls</span>
+                      <span className="text-zinc-600">JSON array of URLs, drains queue with 2 parallel workers</span>
+                    </div>
+                    <div className="py-2 flex flex-col sm:flex-row sm:justify-between gap-1">
+                      <span className="font-bold text-amber-700">POST /upload-url</span>
+                      <span className="text-zinc-600">Delegates to Telegram JSON directly (zero worker RAM consumed)</span>
+                    </div>
+                    <div className="py-2 flex flex-col sm:flex-row sm:justify-between gap-1">
+                      <span className="font-bold text-emerald-700">GET /proxy?url=:url&id=:postId</span>
+                      <span className="text-zinc-600">Zero-copy streaming proxy (body.tee) with Telegram background archival</span>
+                    </div>
+                    <div className="py-2 flex flex-col sm:flex-row sm:justify-between gap-1">
+                      <span className="font-bold text-zinc-900">GET /img/:fileId</span>
+                      <span className="text-zinc-600">Direct instant edge delivery from Telegram CDN cache</span>
+                    </div>
+                  </div>
+                </div>
+
               </div>
             )}
 
