@@ -1779,6 +1779,175 @@ async function startServer() {
     }
   });
 
+  // ── Prune Orphaned R2 Images with 100% Verified Telegram Backup Guard ─────────
+  app.post("/api/image-worker/prune-orphans", express.json(), async (req, res) => {
+    try {
+      const { dry_run = false, worker_url, auto_archive_missing = true } = req.body || {};
+      const workerBase = getImageWorkerBaseUrl(worker_url);
+      const posts = await robustGetAllPosts();
+      const tgToken = process.env.TELEGRAM_BOT_TOKEN || "8947409354:AAHFQfR1Tyy9BBDS383fA6v0kOS3GNifTt0";
+
+      // 1. Fetch live object list from R2 Bucket via Worker endpoint
+      let r2List: Array<{ key: string; size?: number; uploaded?: string }> = [];
+      try {
+        const listRes = await fetch(`${workerBase}/r2/list`, {
+          signal: AbortSignal.timeout(8000)
+        });
+        if (listRes.ok) {
+          const listData = await listRes.json();
+          r2List = listData.objects || listData.keys || listData.files || [];
+        }
+      } catch (err: any) {
+        console.warn("[Prune R2] Worker /r2/list not reachable directly, using DB-correlated inventory:", err.message);
+      }
+
+      // If /r2/list returned empty, generate inventory from DB R2 references
+      if (r2List.length === 0) {
+        const discoveredKeys = new Set<string>();
+        posts.forEach(p => {
+          if (p.thumbnail_url && (p.thumbnail_url.includes('/img/posts/') || p.thumbnail_url.includes('/r2/posts/'))) {
+            const m = p.thumbnail_url.match(/\/(img|r2)\/(posts\/[^?#]+)/);
+            if (m && m[2]) discoveredKeys.add(m[2]);
+          }
+        });
+        r2List = Array.from(discoveredKeys).map(k => ({ key: k }));
+      }
+
+      // 2. Build map of Active Posts in Database
+      const activePostIds = new Set(posts.map(p => String(p.post_id)));
+      const postMap = new Map(posts.map(p => [String(p.post_id), p]));
+
+      // 3. Categorize R2 keys into Active vs Orphaned
+      const activeKeys: string[] = [];
+      const orphanedKeys: string[] = [];
+      const verificationResults: Array<{
+        key: string;
+        postId: string | null;
+        status: 'verified_telegram' | 'archived_now' | 'unverified_kept_safe' | 'orphan_safe_to_delete';
+        telegramFileId?: string | null;
+        detail: string;
+      }> = [];
+
+      for (const item of r2List) {
+        const key = item.key;
+        // Extract post_id from key (e.g. posts/12345.jpg or proxy/12345.jpg)
+        const match = key.match(/(?:posts|proxy)\/([a-zA-Z0-9_-]+)(?:\.[a-zA-Z0-9]+)?/);
+        const postId = match ? match[1] : null;
+
+        if (!postId || !activePostIds.has(postId)) {
+          // True Orphan: Not linked to any active database post
+          orphanedKeys.push(key);
+          verificationResults.push({
+            key,
+            postId,
+            status: 'orphan_safe_to_delete',
+            detail: 'Unlinked orphan: No active database post found for this key.'
+          });
+        } else {
+          // Linked to Active Post: MUST Verify 100% Telegram Backup before considering R2 delete
+          activeKeys.push(key);
+          const post = postMap.get(postId)!;
+          let hasValidTelegram = false;
+          let tgFileId = (post as any).telegram_file_id || null;
+
+          // Check if post already has verified telegram_file_id
+          if (tgFileId) {
+            try {
+              const tgCheck = await fetch(`https://api.telegram.org/bot${tgToken}/getFile?file_id=${tgFileId}`, {
+                signal: AbortSignal.timeout(3000)
+              });
+              const tgData = await tgCheck.json();
+              if (tgData.ok && tgData.result?.file_path) {
+                hasValidTelegram = true;
+              }
+            } catch {}
+          }
+
+          // If no telegram file ID or verification failed, auto-archive to Telegram with rate control
+          if (!hasValidTelegram && auto_archive_missing && post.thumbnail_url) {
+            try {
+              // Rate safe fetch & backup to Telegram
+              const uploadRes = await uploadImageUrlToWorker(post.thumbnail_url, post.post_id, worker_url);
+              if (uploadRes && uploadRes.fileId) {
+                tgFileId = uploadRes.fileId;
+                hasValidTelegram = true;
+                // Update DB with verified telegram_file_id
+                await supabase.from('unified_posts').update({
+                  telegram_file_id: tgFileId,
+                  thumbnail_url: `${workerBase}/img/${tgFileId}`
+                }).eq('post_id', post.post_id);
+              }
+            } catch (err: any) {
+              console.warn(`[Prune Verification] Auto-archive failed for ${post.post_id}:`, err.message);
+            }
+          }
+
+          if (hasValidTelegram) {
+            verificationResults.push({
+              key,
+              postId,
+              status: 'verified_telegram',
+              telegramFileId: tgFileId,
+              detail: '100% Verified in Telegram storage. Safe to prune R2 copy to reclaim storage.'
+            });
+          } else {
+            verificationResults.push({
+              key,
+              postId,
+              status: 'unverified_kept_safe',
+              detail: 'Telegram backup not verified 100%. KEPT SAFE in R2, deletion skipped.'
+            });
+          }
+        }
+      }
+
+      // Keys safe to delete: unlinked orphans + active keys that are 100% VERIFIED in Telegram
+      const safeToDeleteKeys = [
+        ...orphanedKeys,
+        ...verificationResults.filter(r => r.status === 'verified_telegram').map(r => r.key)
+      ];
+
+      let deletedCount = 0;
+      let deleteErrors: string[] = [];
+
+      if (!dry_run && safeToDeleteKeys.length > 0) {
+        // Execute batch delete on worker
+        try {
+          const delRes = await fetch(`${workerBase}/r2/delete`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ keys: safeToDeleteKeys }),
+            signal: AbortSignal.timeout(10000)
+          });
+          if (delRes.ok) {
+            const delData = await delRes.json();
+            deletedCount = delData.deleted_count ?? safeToDeleteKeys.length;
+          } else {
+            deleteErrors.push(`Worker returned HTTP ${delRes.status}`);
+          }
+        } catch (delErr: any) {
+          deleteErrors.push(delErr.message);
+        }
+      }
+
+      return res.json({
+        success: true,
+        dry_run,
+        total_scanned_r2: r2List.length,
+        total_db_posts: posts.length,
+        orphaned_count: orphanedKeys.length,
+        verified_telegram_count: verificationResults.filter(r => r.status === 'verified_telegram').length,
+        unverified_preserved_count: verificationResults.filter(r => r.status === 'unverified_kept_safe').length,
+        safe_to_delete_count: safeToDeleteKeys.length,
+        deleted_count: deletedCount,
+        delete_errors: deleteErrors,
+        results: verificationResults
+      });
+    } catch (e: any) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
   // ── Image Proxy ──────────────────────────────────────────────────────────────
   app.get(["/api/proxy-image", "/api/proxy/image"], async (req, res) => {
     try {

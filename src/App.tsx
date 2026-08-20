@@ -46,11 +46,25 @@ interface ScrapedPost {
   dbStatus?: "pending" | "processing" | "success" | "error" | "duplicate" | "dropped";
 }
 
-function getProxyImageUrl(url?: string, title?: string, postId?: string): string {
+function resolveMasterImageUrl(thumbOrId?: string, masterDomain?: string): string {
+  if (!thumbOrId) return "";
+  const trimmed = thumbOrId.trim();
+  if (trimmed.startsWith("http://") || trimmed.startsWith("https://") || trimmed.startsWith("/api/")) {
+    return trimmed;
+  }
+  const base = (masterDomain || "https://goonimage.sb2127061.workers.dev").replace(/\/+$/, '');
+  if (trimmed.startsWith("posts/") || trimmed.startsWith("proxy/")) {
+    return `${base}/img/${trimmed}`;
+  }
+  return `${base}/img/${trimmed}`;
+}
+
+function getProxyImageUrl(url?: string, title?: string, postId?: string, masterDomain?: string): string {
   if (!url) return "";
-  if (url.startsWith("/api/")) return url;
-  if (url.includes(".workers.dev/img/")) return url;
-  let res = `/api/proxy-image?url=${encodeURIComponent(url)}`;
+  const resolved = resolveMasterImageUrl(url, masterDomain);
+  if (resolved.startsWith("/api/")) return resolved;
+  if (resolved.includes(".workers.dev/img/") || resolved.startsWith("https://goonimage")) return resolved;
+  let res = `/api/proxy-image?url=${encodeURIComponent(resolved)}`;
   if (title) res += `&title=${encodeURIComponent(title)}`;
   if (postId) res += `&id=${encodeURIComponent(postId)}`;
   return res;
@@ -127,6 +141,12 @@ export default function App() {
   const [testImageResult, setTestImageResult] = useState<any>(null);
   const [isTestingImage, setIsTestingImage] = useState(false);
   const [autoSyncImagesToR2, setAutoSyncImagesToR2] = useState(true);
+
+  // ── Prune Orphaned R2 Images state ──────────────────────────────────────────
+  const [isPruningR2, setIsPruningR2] = useState(false);
+  const [pruneDryRun, setPruneDryRun] = useState(true);
+  const [autoArchiveMissing, setAutoArchiveMissing] = useState(true);
+  const [pruneResult, setPruneResult] = useState<any>(null);
 
   // ── Server-side crawler state (survives browser close) ─────────────────────
   const [serverCrawlerState, setServerCrawlerState] = useState<any>(null);
@@ -296,6 +316,40 @@ export default function App() {
       addLog("error", `Image Worker Sync error: ${e.message}`);
     } finally {
       setIsImageSyncing(false);
+    }
+  };
+
+  const handlePruneOrphanedImages = async (dryRun: boolean = pruneDryRun) => {
+    setIsPruningR2(true);
+    setPruneResult(null);
+    addLog("info", `Initiating R2 Orphaned Images Prune (${dryRun ? 'DRY RUN - Safe Simulation' : 'PERMANENT PURGE'})...`);
+
+    try {
+      const res = await fetch("/api/image-worker/prune-orphans", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          dry_run: dryRun,
+          auto_archive_missing: autoArchiveMissing,
+          worker_url: imageWorkerUrl
+        })
+      });
+
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Prune failed");
+
+      setPruneResult(data);
+      if (dryRun) {
+        addLog("warn", `[DRY RUN] Found ${data.orphaned_count} orphans, ${data.verified_telegram_count} verified in Telegram (Ready to prune: ${data.safe_to_delete_count}, Preserved: ${data.unverified_preserved_count})`);
+      } else {
+        addLog("success", `Successfully purged ${data.deleted_count} orphaned & Telegram-verified images from R2!`);
+        await fetchImageStats();
+        fetchDbPosts();
+      }
+    } catch (e: any) {
+      addLog("error", `Prune R2 Error: ${e.message}`);
+    } finally {
+      setIsPruningR2(false);
     }
   };
 
@@ -1735,18 +1789,21 @@ async function runSequentialCrawler(startUrl) {
                               <div>
                                 {(() => {
                                   const total = post.embeds?.length || 0;
-                                  let dood = 0, vid = 0, lulu = 0, other = 0;
+                                  let playmate = 0, dood = 0, vid = 0, lulu = 0, other = 0;
                                   post.embeds?.forEach(emb => {
                                     const l = emb.toLowerCase();
-                                    if (l.includes("lulu")) lulu++;
-                                    else if (l.match(/dood|ds2play|d000d|vide0|do7go|playmogo/)) dood++;
+                                    if (l.includes("playmate")) playmate++;
+                                    else if (l.match(/vidara|vidaarax|vidavaca|vidaratem|vidaraw/)) vid++;
+                                    else if (l.match(/dood|ds2play|d000d|vide0|do7go|playmogo|doodstream/)) dood++;
+                                    else if (l.includes("lulu")) lulu++;
                                     else other++;
                                   });
                                   return (
                                     <span className="text-[9px] text-[#1A1A1A]/70 uppercase font-sans font-bold tracking-wider block mb-1.5">
-                                      Scraped Embeds ({total}) 
-                                      <span className="ml-2 font-mono text-zinc-500 font-normal">
-                                      </span>
+                                      Scraped Embeds ({total})
+                                      {playmate > 0 && <span className="ml-1.5 text-emerald-800 bg-emerald-100 px-1 py-0.2 rounded font-mono font-bold">{playmate} Playmate</span>}
+                                      {vid > 0 && <span className="ml-1 text-amber-800 bg-amber-100 px-1 py-0.2 rounded font-mono font-bold">{vid} Vidara</span>}
+                                      {dood > 0 && <span className="ml-1 text-blue-800 bg-blue-100 px-1 py-0.2 rounded font-mono font-bold">{dood} Dood</span>}
                                     </span>
                                   );
                                 })()}
@@ -1757,13 +1814,18 @@ async function runSequentialCrawler(startUrl) {
                                       let colorClass = "bg-cyan-100 text-cyan-900 border-cyan-900/50";
                                       
                                       const lowerEmb = emb.toLowerCase();
-                                      if (lowerEmb.includes("lulu")) {
+                                      if (lowerEmb.includes("playmate")) {
+                                        label = "Playmate";
+                                        colorClass = "bg-emerald-100 text-emerald-950 border-emerald-600/70 shadow-sm";
+                                      } else if (lowerEmb.includes("vidara") || lowerEmb.match(/vidaarax|vidavaca|vidaratem|vidaraw/)) {
+                                        label = "Vidara";
+                                        colorClass = "bg-amber-100 text-amber-950 border-amber-600/70";
+                                      } else if (lowerEmb.includes("lulu")) {
                                         label = "Luluvid";
                                         colorClass = "bg-purple-100 text-purple-900 border-purple-900/50";
-                                      } else if (lowerEmb.includes("doodstream")) {
+                                      } else if (lowerEmb.match(/dood|ds2play|d000d|vide0|do7go|playmogo|doodstream/)) {
                                         label = "Doodstream";
                                         colorClass = "bg-blue-100 text-blue-900 border-blue-900/50";
-                                        colorClass = "bg-rose-100 text-rose-900 border-rose-900/50";
                                       }
 
                                       return (
@@ -1774,6 +1836,7 @@ async function runSequentialCrawler(startUrl) {
                                             rel="noreferrer"
                                             className={`text-[9px] px-2 py-1 rounded-none border font-sans font-bold uppercase tracking-wider flex items-center gap-1 transition-all hover:brightness-95 ${colorClass}`}
                                           >
+                                            {label === "Playmate" && <span className="text-[10px]">▶</span>}
                                             {label}
                                             <ExternalLink className="w-2.5 h-2.5" />
                                           </a>
@@ -1902,13 +1965,22 @@ async function runSequentialCrawler(startUrl) {
                   {task.final_embeds && task.final_embeds.length > 0 && (
                     <div className="flex flex-wrap gap-1">
                       {task.final_embeds.map((url: string, i: number) => {
-                        const isDood   = url.match(/dood/i);
+                        const isPlaymate = url.match(/playmate/i);
+                        const isVidara   = url.match(/vidara|vidaarax|vidavaca|vidaratem|vidaraw/i);
+                        const isDood     = url.match(/dood|ds2play|d000d|vide0|do7go|playmogo|doodstream/i);
+                        const isLulu     = url.match(/lulu/i);
+                        const label = isPlaymate ? 'Playmate' : isVidara ? 'Vidara' : isDood ? 'Dood' : isLulu ? 'Luluvid' : 'Embed';
                         return (
                           <a key={i} href={url} target="_blank" rel="noreferrer"
                              className={`text-[9px] px-1.5 py-0.5 border font-mono font-bold uppercase flex items-center gap-1 ${
-                               isDood   ? 'bg-blue-100 text-blue-800 border-blue-300' :
-                                          'bg-zinc-100 text-zinc-700 border-zinc-300'
+                               isPlaymate ? 'bg-emerald-100 text-emerald-900 border-emerald-400' :
+                               isVidara   ? 'bg-amber-100 text-amber-900 border-amber-400' :
+                               isDood     ? 'bg-blue-100 text-blue-800 border-blue-300' :
+                               isLulu     ? 'bg-purple-100 text-purple-800 border-purple-300' :
+                                            'bg-zinc-100 text-zinc-700 border-zinc-300'
                              }`}>
+                            {label}
+                            <ExternalLink className="w-2 h-2" />
                           </a>
                         );
                       })}
@@ -2254,7 +2326,7 @@ async function runSequentialCrawler(startUrl) {
                            )}
                            <div className="flex-1 min-w-0">
                               <h4 className="text-xs font-bold text-[#1A1A1A] truncate">{post.title}</h4>
-                              <div className="flex items-center gap-2 mt-1">
+                              <div className="flex flex-wrap items-center gap-2 mt-1">
                                 <span className="text-[10px] font-mono text-zinc-500">ID: {post.post_id}</span>
                                 {post.thumbnail_url && !(post.thumbnail_url.includes('.workers.dev/') || post.thumbnail_url.startsWith('https://goonimage')) && (
                                   <button
@@ -2271,6 +2343,38 @@ async function runSequentialCrawler(startUrl) {
                                   </span>
                                 ))}
                               </div>
+
+                              {/* Embed Badges in DB View */}
+                              {post.embeds && post.embeds.length > 0 && (
+                                <div className="flex flex-wrap items-center gap-1 mt-1.5">
+                                  {post.embeds.map((emb: string, i: number) => {
+                                    const isPlaymate = emb.toLowerCase().includes("playmate");
+                                    const isVidara   = emb.toLowerCase().match(/vidara|vidaarax|vidavaca|vidaratem|vidaraw/);
+                                    const isDood     = emb.toLowerCase().match(/dood|ds2play|d000d|vide0|do7go|playmogo|doodstream/);
+                                    const isLulu     = emb.toLowerCase().includes("lulu");
+                                    const label = isPlaymate ? "Playmate" : isVidara ? "Vidara" : isDood ? "Doodstream" : isLulu ? "Luluvid" : "Stream";
+                                    const colorClass = isPlaymate ? "bg-emerald-100 text-emerald-900 border-emerald-400"
+                                      : isVidara ? "bg-amber-100 text-amber-900 border-amber-400"
+                                      : isDood ? "bg-blue-100 text-blue-900 border-blue-400"
+                                      : isLulu ? "bg-purple-100 text-purple-900 border-purple-400"
+                                      : "bg-zinc-100 text-zinc-800 border-zinc-300";
+
+                                    return (
+                                      <a
+                                        key={i}
+                                        href={emb}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        className={`text-[9px] font-mono font-bold uppercase px-1.5 py-0.5 border flex items-center gap-1 hover:brightness-95 transition-all ${colorClass}`}
+                                      >
+                                        {isPlaymate && <span>▶</span>}
+                                        {label}
+                                        <ExternalLink className="w-2 h-2" />
+                                      </a>
+                                    );
+                                  })}
+                                </div>
+                              )}
                            </div>
                            <div className="flex items-center gap-2 shrink-0">
                              <button
@@ -2510,6 +2614,124 @@ async function runSequentialCrawler(startUrl) {
                         : 'bg-emerald-50 text-emerald-900'
                     }`}>
                       {imageSyncLog}
+                    </div>
+                  )}
+                </div>
+
+                {/* 🧹 Prune Orphaned Images & 100% Verified Telegram Backup Guard */}
+                <div className="bg-white border-2 border-[#1A1A1A] p-6 shadow-[4px_4px_0px_#1A1A1A] flex flex-col gap-4">
+                  <div className="border-b border-[#1A1A1A] pb-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div>
+                      <h4 className="text-sm font-bold font-serif italic text-[#1A1A1A] flex items-center gap-2">
+                        <span>🧹 Prune Orphaned Images & Reclaim R2 Storage</span>
+                        <span className="text-[10px] font-mono bg-emerald-100 text-emerald-900 border border-emerald-500 px-1.5 py-0.5 font-bold">100% Telegram Verification Guard</span>
+                      </h4>
+                      <p className="text-xs text-zinc-600 mt-0.5 leading-relaxed">
+                        Cross-references live R2 bucket files against active Database records. Unlinked orphans and posts that are <strong className="text-emerald-800">100% verified in Telegram</strong> are safely pruned to keep your R2 storage minimal and free.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="bg-amber-50/70 border border-amber-300 p-3 text-xs text-amber-900 font-mono flex items-start gap-2">
+                    <span className="text-base leading-none">🛡️</span>
+                    <div>
+                      <strong>Zero Data-Loss Guarantee:</strong> Before deleting any image from R2, the system validates the Telegram <code className="bg-amber-100 px-1 py-0.5">file_id</code> directly against Telegram API. If Telegram verification is not 100% confirmed, the image is <em>kept safe in R2</em> and deletion is skipped.
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 items-end">
+                    <div className="flex flex-col gap-2">
+                      <label className="flex items-center gap-2 text-xs font-sans text-zinc-700 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          id="chk_auto_archive_missing"
+                          checked={autoArchiveMissing}
+                          onChange={(e) => setAutoArchiveMissing(e.target.checked)}
+                          disabled={isPruningR2}
+                          className="w-4 h-4 accent-[#1A1A1A]"
+                        />
+                        <span>Auto-archive missing backups to Telegram first</span>
+                      </label>
+                      <label className="flex items-center gap-2 text-xs font-sans text-zinc-700 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          id="chk_dry_run"
+                          checked={pruneDryRun}
+                          onChange={(e) => setPruneDryRun(e.target.checked)}
+                          disabled={isPruningR2}
+                          className="w-4 h-4 accent-[#1A1A1A]"
+                        />
+                        <span className="font-bold">Dry Run (Simulate safely first)</span>
+                      </label>
+                    </div>
+
+                    <div className="sm:col-span-2 flex flex-col sm:flex-row gap-2">
+                      <button
+                        id="btn_sim_prune_r2"
+                        onClick={() => handlePruneOrphanedImages(true)}
+                        disabled={isPruningR2}
+                        className="flex-1 bg-amber-600 hover:bg-amber-700 text-white font-bold py-2.5 px-3 rounded-none flex items-center justify-center gap-1.5 transition-all text-xs uppercase tracking-wider border-2 border-[#1A1A1A] shadow-[2px_2px_0px_#1A1A1A] disabled:opacity-50"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${isPruningR2 && pruneDryRun ? 'animate-spin' : ''}`} />
+                        {isPruningR2 && pruneDryRun ? 'Scanning...' : 'Simulate Dry Run'}
+                      </button>
+
+                      <button
+                        id="btn_execute_prune_r2"
+                        onClick={() => {
+                          if (window.confirm("Are you sure you want to permanently prune orphaned and 100% Telegram-verified images from R2?")) {
+                            handlePruneOrphanedImages(false);
+                          }
+                        }}
+                        disabled={isPruningR2}
+                        className="flex-1 bg-red-700 hover:bg-red-800 text-white font-bold py-2.5 px-3 rounded-none flex items-center justify-center gap-1.5 transition-all text-xs uppercase tracking-wider border-2 border-[#1A1A1A] shadow-[2px_2px_0px_#1A1A1A] disabled:opacity-50"
+                      >
+                        <Trash2 className={`w-3.5 h-3.5 ${isPruningR2 && !pruneDryRun ? 'animate-spin' : ''}`} />
+                        {isPruningR2 && !pruneDryRun ? 'Pruning R2...' : 'Prune R2 Now'}
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Prune Results Feed */}
+                  {pruneResult && (
+                    <div className="bg-[#FAF8F5] border-2 border-[#1A1A1A] p-4 text-xs font-mono flex flex-col gap-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-300 pb-2">
+                        <span className="font-bold text-[#1A1A1A]">
+                          {pruneResult.dry_run ? '🔍 Dry Run Simulation Summary' : '✅ Prune Execution Complete'}
+                        </span>
+                        <div className="flex gap-2">
+                          <span className="bg-zinc-200 px-2 py-0.5">Scanned: {pruneResult.total_scanned_r2}</span>
+                          <span className="bg-emerald-100 text-emerald-900 px-2 py-0.5 font-bold">100% TG Verified: {pruneResult.verified_telegram_count}</span>
+                          <span className="bg-red-100 text-red-900 px-2 py-0.5 font-bold">Orphans: {pruneResult.orphaned_count}</span>
+                          <span className="bg-blue-100 text-blue-900 px-2 py-0.5 font-bold">Preserved Safe: {pruneResult.unverified_preserved_count}</span>
+                        </div>
+                      </div>
+
+                      {pruneResult.results && pruneResult.results.length > 0 ? (
+                        <div className="max-h-48 overflow-y-auto divide-y divide-zinc-200 bg-white border border-zinc-300 p-2">
+                          {pruneResult.results.map((res: any, idx: number) => {
+                            let badgeClass = "bg-zinc-100 text-zinc-700";
+                            if (res.status === 'verified_telegram') badgeClass = "bg-emerald-100 text-emerald-900 font-bold border-emerald-400";
+                            else if (res.status === 'orphan_safe_to_delete') badgeClass = "bg-red-100 text-red-900 font-bold border-red-400";
+                            else if (res.status === 'unverified_kept_safe') badgeClass = "bg-amber-100 text-amber-900 font-bold border-amber-400";
+
+                            return (
+                              <div key={idx} className="py-1.5 flex flex-col sm:flex-row sm:items-center justify-between gap-1">
+                                <div className="flex items-center gap-2">
+                                  <span className={`text-[9px] px-1.5 py-0.5 border ${badgeClass}`}>{res.status}</span>
+                                  <span className="font-bold">{res.key}</span>
+                                  {res.postId && <span className="text-zinc-400">({res.postId})</span>}
+                                </div>
+                                <span className="text-[10px] text-zinc-500">{res.detail}</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <div className="text-zinc-500 italic text-center py-2">
+                          No orphaned or pending images found. R2 is clean!
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
