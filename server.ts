@@ -889,6 +889,7 @@ const serverCrawler = {
 const CRAWLER_MAX_RETRIES = 8;
 const CRAWLER_RETRY_DELAY_MS = 30000;
 const DUPLICATE_STREAK_STOP = 3;
+const DUPLICATE_REFRESH_DELAY_MS = 100 * 60 * 1000; // 100 minutes (6,000,000 ms) refresh duration
 
 function crawlerLog(msg: string) {
   const ts = new Date().toISOString();
@@ -1028,7 +1029,8 @@ async function runServerCrawler(port: number): Promise<void> {
     });
 
     if (serverCrawler.duplicateStreak >= DUPLICATE_STREAK_STOP) {
-      crawlerLog(`reached ${DUPLICATE_STREAK_STOP} consecutive duplicate pages. Restarting from beginning in 30 seconds...`);
+      const waitMinutes = Math.round(DUPLICATE_REFRESH_DELAY_MS / 60000);
+      crawlerLog(`reached ${DUPLICATE_STREAK_STOP} consecutive duplicate pages. Refresh cooldown active: restarting from beginning in ${waitMinutes} minutes...`);
       serverCrawler.duplicateStreak = 0;
       serverCrawler.lastUrl = null;
       serverCrawler.currentUrl = "https://sxyprn.com/blog/all/0.html";
@@ -1040,7 +1042,23 @@ async function runServerCrawler(port: number): Promise<void> {
         consecutiveDuplicatePages: 0,
       });
 
-      await new Promise(r => setTimeout(r, 30000));
+      // Interruptible 100-minute wait loop so stopping/aborting responds immediately
+      const stepMs = 1000;
+      let waitedMs = 0;
+      while (waitedMs < DUPLICATE_REFRESH_DELAY_MS && serverCrawler.running && !serverCrawlerAbort) {
+        await new Promise(r => setTimeout(r, stepMs));
+        waitedMs += stepMs;
+        // Log status update every 10 minutes
+        if (waitedMs % (10 * 60 * 1000) === 0 && waitedMs < DUPLICATE_REFRESH_DELAY_MS) {
+          const remainingMins = Math.round((DUPLICATE_REFRESH_DELAY_MS - waitedMs) / 60000);
+          crawlerLog(`Duplicate cooldown active: ${remainingMins} minutes remaining before restarting from beginning...`);
+        }
+      }
+
+      if (!serverCrawler.running || serverCrawlerAbort) {
+        break;
+      }
+      crawlerLog(`100-minute duplicate cooldown completed. Restarting crawl from ${serverCrawler.currentUrl}`);
       continue;
     }
 

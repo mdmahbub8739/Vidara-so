@@ -908,9 +908,31 @@ export default function App() {
         });
 
         if (autoQueueRef.current && duplicateStreakRef.current >= DUPLICATE_STREAK_STOP_THRESHOLD) {
-          setIsCrawling(false);
-          setCountdown(null);
-          addLog("warn", `থামানো হলো: পরপর ${DUPLICATE_STREAK_STOP_THRESHOLD}টা পেজেই কোনো নতুন পোস্ট পাওয়া যায়নি — আগে স্ক্র্যাপ করা কন্টেন্টে পৌঁছে গেছে। Checkpoint সেভ করা আছে।`);
+          const DUPLICATE_REFRESH_DELAY_MS = 100 * 60 * 1000; // 100 minutes
+          const waitMins = Math.round(DUPLICATE_REFRESH_DELAY_MS / 60000);
+          addLog("warn", `পরপর ${DUPLICATE_STREAK_STOP_THRESHOLD}টি পেজেই সব ডুপ্লিকেট। ${waitMins} মিনিট রিফ্রেশ কুলডাউন পর আবার শুরু থেকে (0.html) রিস্টার্ট হবে...`);
+          setTargetUrl("https://sxyprn.com/blog/all/0.html");
+          duplicateStreakRef.current = 0;
+          setConsecutiveDuplicatePages(0);
+          
+          saveCheckpoint("https://sxyprn.com/blog/all/0.html", 0, {
+            lastUrl: null,
+            pagesCrawledDelta: 0,
+          });
+
+          setCountdown(DUPLICATE_REFRESH_DELAY_MS / 1000);
+          setCountdownMax(DUPLICATE_REFRESH_DELAY_MS / 1000);
+          let remaining = DUPLICATE_REFRESH_DELAY_MS / 1000;
+          countdownInterval = setInterval(() => {
+            remaining -= 1;
+            setCountdown(remaining > 0 ? remaining : null);
+            if (remaining <= 0 && countdownInterval) clearInterval(countdownInterval);
+          }, 1000);
+          timer = setTimeout(() => {
+            if (!isMounted || !isCrawling) return;
+            addLog("info", `১০০ মিনিট কুলডাউন সমাপ্ত। শুরু থেকে স্ক্র্যাপিং শুরু হচ্ছে...`);
+            runCrawlLoop();
+          }, DUPLICATE_REFRESH_DELAY_MS);
           return;
         }
 
@@ -1250,27 +1272,31 @@ async function runSequentialCrawler(startUrl) {
                 </div>
               </div>
 
-              {/* Human Pacing Countdown Ticker */}
+              {/* Human Pacing / Duplicate Cooldown Countdown Ticker */}
               {countdown !== null && isCrawling && (
                 <div className="bg-[#FEF3C7] border-2 border-[#1A1A1A] p-3 text-xs flex flex-col gap-2 shadow-[2px_2px_0px_#1A1A1A] mt-2">
                   <div className="flex items-center justify-between font-bold">
                     <span className="text-[#92400E] flex items-center gap-1">
                       <span className="animate-pulse text-[#D97706] inline-block">⏳</span>
-                      Safe Human Delay Active...
+                      {countdown > 120 ? "Duplicate Cooldown / Refresh Loop Active..." : "Safe Human Delay Active..."}
                     </span>
-                    <span className="font-mono text-[#D97706]">Next Page in {countdown}s</span>
+                    <span className="font-mono text-[#D97706]">
+                      Next Page in {countdown >= 60 ? `${Math.floor(countdown / 60)}m ${(countdown % 60).toString().padStart(2, '0')}s` : `${countdown}s`}
+                    </span>
                   </div>
                   <div className="w-full bg-[#FAF8F5] border border-[#1A1A1A] h-2 relative overflow-hidden">
                     <motion.div
                       key={countdown}
-                      initial={{ width: `${((countdown + 1) / countdownMax) * 100}%` }}
-                      animate={{ width: `${(countdown / countdownMax) * 100}%` }}
+                      initial={{ width: `${((countdown + 1) / (countdownMax || countdown + 1)) * 100}%` }}
+                      animate={{ width: `${(countdown / (countdownMax || countdown)) * 100}%` }}
                       transition={{ duration: 1, ease: "linear" }}
                       className="bg-[#D97706] h-full"
                     />
                   </div>
                   <p className="text-[9px] text-[#92400E]/80 font-serif italic text-center">
-                    Simulating randomized human browsing patterns to safely bypass Cloudflare/IP blocks.
+                    {countdown > 120 
+                      ? "100-minute cooldown active across full duplicate streak to allow source site to update before refreshing from beginning."
+                      : "Simulating randomized human browsing patterns to safely bypass Cloudflare/IP blocks."}
                   </p>
                 </div>
               )}
